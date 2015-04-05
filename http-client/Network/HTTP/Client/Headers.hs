@@ -81,7 +81,7 @@ parseStatusHeaders conn timeout' cont
             Just (i, "") -> Just i
             _ -> Nothing
 
-    parseHeaders 100 _ = throwIO OverlongHeaders
+    parseHeaders 1000 _ = throwIO OverlongHeaders
     parseHeaders count front = do
         line <- connectionReadLine conn
         if S.null line
