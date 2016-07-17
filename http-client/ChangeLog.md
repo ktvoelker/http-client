@@ -1,3 +1,71 @@
+## 0.4.30
+
+* Initial implementation of [#193](https://github.com/snoyberg/http-client/issues/193)
+    * Deprecate `parseUrl`
+    * Add `parseUrlThrow`, `parseRequest`, and `parseRequest_`
+
+## 0.4.29
+
+* Changed the order of connecting a socket and tweaking a socket, such that the socket tweaking callback now happen before connecting.
+* add setRequestIgnoreStatus [#201](https://github.com/snoyberg/http-client/pull/201)
+* Added missing Host: HTTP header for https CONNECT [#192](https://github.com/snoyberg/http-client/pull/192)
+* Fix: Redirects will be followed in httpRaw' when reusing a dead connection [#195](https://github.com/snoyberg/http-client/issues/195)
+
+## 0.4.28
+
+* Add support for including request method in URL
+* `requestManagerOverride`
+* `RequestBodyIO`
+
+## 0.4.27.1
+
+* Incorrect idle connection count in HTTP manager [#185](https://github.com/snoyberg/http-client/issues/185)
+
+## 0.4.27
+
+* Enable managerModifyRequest to modify checkStatus [#179](https://github.com/snoyberg/http-client/pull/179)
+
+## 0.4.26.2
+
+* Fix compilation for GHC 7.4
+
+## 0.4.26.1
+
+* Fix compilation for GHC < 7.10
+
+## 0.4.26
+
+* Make sure we never read from or write to closed socket [#170](https://github.com/snoyberg/http-client/pull/170)
+
+## 0.4.25
+
+* Don't error out when response body flushing fails [#169](https://github.com/snoyberg/http-client/issues/169)
+
+## 0.4.24
+
+* Use a new `TlsExceptionHostPort` exception to indicate the host and port of the server we were trying to connect to when a TLS exception occurred. See [commercialhaskell/stack#1010](https://github.com/commercialhaskell/stack/issues/1010)
+
+## 0.4.23
+
+* Case insensitive cookie domains [#158](https://github.com/snoyberg/http-client/issues/158)
+
+## 0.4.22
+
+* ProxyConnectException now returns Right HttpException. [#155](https://github.com/snoyberg/http-client/pull/155)
+
+## 0.4.21
+
+* Support `no_proxy` environment variable. [#140](https://github.com/snoyberg/http-client/issues/140) [#145](https://github.com/snoyberg/http-client/pull/145)
+
+## 0.4.20
+
+* Expose `brReadSome`
+
+## 0.4.19
+
+* Move HasHttpManager from http-conduit to http-client [#147](https://github.com/snoyberg/http-client/pull/147)
+* Chunked request bodies use less TCP packets [#149](https://github.com/snoyberg/http-client/issues/149)
+
 ## 0.4.18
 
 * Deprecate closeManager [#136](https://github.com/snoyberg/http-client/issues/136) [#137](https://github.com/snoyberg/http-client/issues/137)

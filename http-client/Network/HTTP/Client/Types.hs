@@ -7,6 +7,7 @@ module Network.HTTP.Client.Types
     ( BodyReader
     , Connection (..)
     , StatusHeaders (..)
+    , ConnectionClosed (..)
     , HttpException (..)
     , Cookie (..)
     , CookieJar (..)
@@ -22,6 +23,7 @@ module Network.HTTP.Client.Types
     , Response (..)
     , ResponseClose (..)
     , Manager (..)
+    , HasHttpManager (..)
     , ConnsMap (..)
     , ManagerSettings (..)
     , NonEmptyList (..)
@@ -54,6 +56,7 @@ import qualified Data.Map as Map
 import Data.Text (Text)
 import Data.Streaming.Zlib (ZlibException)
 import Control.Concurrent.MVar (MVar)
+import Data.CaseInsensitive as CI
 
 -- | An @IO@ action that represents an incoming response body coming from the
 -- server. Data provided by this action has already been gunzipped and
@@ -73,11 +76,19 @@ data Connection = Connection
     , connectionWrite :: S.ByteString -> IO ()
       -- ^ Send data to server
     , connectionClose :: IO ()
+      -- ^ Close connection. Any successive operation on the connection
+      -- (exept closing) should fail with `ConnectionClosed` exception.
+      -- It is allowed to close connection multiple times.
     }
     deriving T.Typeable
 
 data StatusHeaders = StatusHeaders Status HttpVersion RequestHeaders
     deriving (Show, Eq, Ord, T.Typeable)
+
+data ConnectionClosed = ConnectionClosed
+  deriving (Eq, Show, T.Typeable)
+
+instance Exception ConnectionClosed
 
 data HttpException = StatusCodeException Status ResponseHeaders CookieJar
                    | InvalidUrlException String String
@@ -99,7 +110,7 @@ data HttpException = StatusCodeException Status ResponseHeaders CookieJar
                    -- on this, see:
                    --
                    -- <https://github.com/snoyberg/http-client/commit/b86b1cdd91e56ee33150433dedb32954d2082621#commitcomment-10718689>
-                   | FailedConnectionException2 String Int Bool SomeException -- ^ host/port/secure
+                   | FailedConnectionException2 String Int Bool SomeException -- ^ host\/port\/secure
                    | ExpectedBlankAfter100Continue
                    | InvalidStatusLine S.ByteString
                    | InvalidHeader S.ByteString
@@ -131,6 +142,10 @@ data HttpException = StatusCodeException Status ResponseHeaders CookieJar
                    -- and @transfer-encoding: chunked@ are used. Since 0.4.8.
                    --
                    -- Since 0.4.11 this exception isn't thrown anymore.
+                   | TlsExceptionHostPort SomeException S.ByteString Int
+                   -- ^ TLS exception, together with the host and port
+                   --
+                   -- @since 0.4.24
     deriving (Show, T.Typeable)
 instance Exception HttpException
 
@@ -158,7 +173,7 @@ newtype CookieJar = CJ { expose :: [Cookie] }
 instance Eq Cookie where
   (==) a b = name_matches && domain_matches && path_matches
     where name_matches = cookie_name a == cookie_name b
-          domain_matches = cookie_domain a == cookie_domain b
+          domain_matches = CI.foldCase (cookie_domain a) == CI.foldCase (cookie_domain b)
           path_matches = cookie_path a == cookie_path b
 
 instance Ord Cookie where
@@ -207,6 +222,11 @@ data RequestBody
     | RequestBodyBuilder Int64 Builder
     | RequestBodyStream Int64 (GivesPopper ())
     | RequestBodyStreamChunked (GivesPopper ())
+    | RequestBodyIO (IO RequestBody)
+    -- ^ Allows creation of a @RequestBody@ inside the @IO@ monad, which is
+    -- useful for making easier APIs (like @setRequestBodyFile@).
+    --
+    -- @since 0.4.28
     deriving T.Typeable
 -- |
 --
@@ -287,17 +307,17 @@ type GivesPopper a = NeedsPopper a -> IO a
 -- | All information on how to connect to a host and what should be sent in the
 -- HTTP request.
 --
--- If you simply wish to download from a URL, see 'parseUrl'.
+-- If you simply wish to download from a URL, see 'parseRequest'.
 --
 -- The constructor for this data type is not exposed. Instead, you should use
--- either the 'def' method to retrieve a default instance, or 'parseUrl' to
+-- either the 'defaultRequest' value, or 'parseRequest' to
 -- construct from a URL, and then use the records below to make modifications.
 -- This approach allows http-client to add configuration options without
 -- breaking backwards compatibility.
 --
 -- For example, to construct a POST request, you could do something like:
 --
--- > initReq <- parseUrl "http://www.example.com/path"
+-- > initReq <- parseRequest "http://www.example.com/path"
 -- > let req = initReq
 -- >             { method = "POST"
 -- >             }
@@ -431,6 +451,13 @@ data Request = Request
     -- Default: ignore @IOException@s, rethrow all other exceptions.
     --
     -- Since: 0.4.6
+
+    , requestManagerOverride :: Maybe Manager
+    -- ^ A 'Manager' value that should override whatever @Manager@ value was
+    -- passed in to the HTTP request function manually. This is useful when
+    -- dealing with implicit global managers, such as in @Network.HTTP.Simple@
+    --
+    -- @since 0.4.28
     }
     deriving T.Typeable
 
@@ -594,6 +621,11 @@ data Manager = Manager
     -- ^ See 'managerProxy'
     }
     deriving T.Typeable
+
+class HasHttpManager a where
+    getHttpManager :: a -> Manager
+instance HasHttpManager Manager where
+    getHttpManager = id
 
 data ConnsMap
     = ManagerClosed

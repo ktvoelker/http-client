@@ -8,6 +8,10 @@
 
 module Network.HTTP.Client.Request
     ( parseUrl
+    , parseUrlThrow
+    , parseRequest
+    , parseRequest_
+    , defaultRequest
     , setUriRelative
     , getUri
     , setUri
@@ -20,11 +24,11 @@ module Network.HTTP.Client.Request
     , needsGunzip
     , requestBuilder
     , useDefaultTimeout
+    , setRequestIgnoreStatus
     , setQueryString
     , streamFile
     , observedStreamFile
-    , username
-    , password
+    , extractBasicAuthInfo
     ) where
 
 import Data.Int (Int64)
@@ -33,7 +37,7 @@ import Data.Monoid (mempty, mappend)
 import Data.String (IsString(..))
 import Data.Char (toLower)
 import Control.Applicative ((<$>))
-import Control.Monad (when, unless)
+import Control.Monad (when, unless, guard)
 import Numeric (showHex)
 
 import Data.Default.Class (Default (def))
@@ -47,7 +51,7 @@ import qualified Data.ByteString.Lazy as L
 import Data.ByteString.Lazy.Internal (defaultChunkSize)
 
 import qualified Network.HTTP.Types as W
-import Network.URI (URI (..), URIAuth (..), parseURI, relativeTo, escapeURIString, isAllowedInURI, isReserved)
+import Network.URI (URI (..), URIAuth (..), parseURI, relativeTo, escapeURIString, unEscapeString, isAllowedInURI, isReserved)
 
 import Control.Monad.IO.Class (liftIO)
 import Control.Exception (Exception, toException, throw, throwIO, IOException)
@@ -65,6 +69,37 @@ import Control.Monad.Catch (MonadThrow, throwM)
 import Data.IORef
 
 import System.IO (withBinaryFile, hTell, hFileSize, Handle, IOMode (ReadMode))
+import Control.Monad (liftM)
+
+-- | Deprecated synonym for 'parseUrlThrow'. You probably want
+-- 'parseRequest' or 'parseRequest_' instead.
+--
+-- @since 0.1.0
+parseUrl :: MonadThrow m => String -> m Request
+parseUrl = parseUrlThrow
+{-# DEPRECATED parseUrl "Please use parseUrlThrow, parseRequest, or parseRequest_ instead" #-}
+
+-- | Same as 'parseRequest', except will throw an 'HttpException' in
+-- the event of a non-2XX response.
+--
+-- @since 0.4.30
+parseUrlThrow :: MonadThrow m => String -> m Request
+parseUrlThrow s' =
+    case parseURI (encode s) of
+        Just uri -> liftM setMethod (setUri def uri)
+        Nothing  -> throwM $ InvalidUrlException s "Invalid URL"
+  where
+    encode = escapeURIString isAllowedInURI
+    (mmethod, s) =
+        case break (== ' ') s' of
+            (x, ' ':y) | all (\c -> 'A' <= c && c <= 'Z') x -> (Just x, y)
+            _ -> (Nothing, s')
+
+    setMethod req =
+        case mmethod of
+            Nothing -> req
+            Just m -> req { method = S8.pack m }
+
 
 -- | Convert a URL into a 'Request'.
 --
@@ -74,19 +109,35 @@ import System.IO (withBinaryFile, hTell, hFileSize, Handle, IOMode (ReadMode))
 -- Since this function uses 'MonadThrow', the return monad can be anything that is
 -- an instance of 'MonadThrow', such as 'IO' or 'Maybe'.
 --
--- Since 0.1.0
-parseUrl :: MonadThrow m => String -> m Request
-parseUrl s =
-    case parseURI (encode s) of
-        Just uri -> setUri def uri
-        Nothing  -> throwM $ InvalidUrlException s "Invalid URL"
+-- You can place the request method at the beginning of the URL separated by a
+-- space, e.g.:
+--
+-- @@@
+-- parseRequeset "POST http://httpbin.org/post"
+-- @@@
+--
+-- Note that the request method must be provided as all capital letters.
+--
+-- @since 0.4.30
+parseRequest :: MonadThrow m => String -> m Request
+parseRequest =
+    liftM noThrow . parseUrlThrow
   where
-    encode = escapeURIString isAllowedInURI
+    noThrow req = req { checkStatus = \_ _ _ -> Nothing }
+
+-- | Same as 'parseRequest', but in the cases of a parse error
+-- generates an impure exception. Mostly useful for static strings which
+-- are known to be correctly formatted.
+parseRequest_ :: String -> Request
+parseRequest_ = either throw id . parseRequest
 
 -- | Add a 'URI' to the request. If it is absolute (includes a host name), add
 -- it as per 'setUri'; if it is relative, merge it with the existing request.
 setUriRelative :: MonadThrow m => Request -> URI -> m Request
 setUriRelative req uri =
+#ifndef MIN_VERSION_network
+#define MIN_VERSION_network(x,y,z) 1
+#endif
 #if MIN_VERSION_network(2,4,0)
     setUri req $ uri `relativeTo` getUri req
 #else
@@ -118,27 +169,20 @@ getUri req = URI
 
 applyAnyUriBasedAuth :: URI -> Request -> Request
 applyAnyUriBasedAuth uri req =
-    if hasAuth
-      then applyBasicAuth (S8.pack theuser) (S8.pack thepass) req
-      else req
+    case extractBasicAuthInfo uri of
+        Just auth -> uncurry applyBasicAuth auth req
+        Nothing -> req
+
+-- | Extract basic access authentication info in URI.
+-- Return Nothing when there is no auth info in URI.
+extractBasicAuthInfo :: URI -> Maybe (S8.ByteString, S8.ByteString)
+extractBasicAuthInfo uri = do
+    userInfo <- uriUserInfo <$> uriAuthority uri
+    guard (':' `elem` userInfo)
+    let (username, ':':password) = break (==':') . takeWhile (/='@') $ userInfo
+    return (toLiteral username, toLiteral password)
   where
-    hasAuth = (notEmpty theuser) && (notEmpty thepass)
-    notEmpty = not . null
-    theuser = username authInfo
-    thepass = password authInfo
-    authInfo = maybe "" uriUserInfo $ uriAuthority uri
-
-username :: String -> String
-username = encode . takeWhile (/=':') . authPrefix
-
-password :: String -> String
-password = encode . takeWhile (/='@') . drop 1 . dropWhile (/=':')
-
-encode :: String -> String
-encode = escapeURIString (not . isReserved)
-
-authPrefix :: String -> String
-authPrefix u = if '@' `elem` u then takeWhile (/= '@') u else ""
+    toLiteral = S8.pack . unEscapeString
 
 -- | Validate a 'URI', then add it to the request.
 setUri :: MonadThrow m => Request -> URI -> m Request
@@ -204,6 +248,12 @@ instance Show Request where
 useDefaultTimeout :: Maybe Int
 useDefaultTimeout = Just (-3425)
 
+-- | A default request value
+--
+-- @since 0.4.30
+defaultRequest :: Request
+defaultRequest = def { checkStatus = \_ _ _ -> Nothing }
+
 instance Default Request where
     def = Request
         { host = "localhost"
@@ -245,6 +295,7 @@ instance Default Request where
             case E.fromException se of
                 Just (_ :: IOException) -> return ()
                 Nothing -> throwIO se
+        , requestManagerOverride = Nothing
         }
 
 instance IsString Request where
@@ -264,7 +315,7 @@ browserDecompress = (/= "application/x-tar")
 -- | Add a Basic Auth header (with the specified user name and password) to the
 -- given Request. Ignore error handling:
 --
--- >  applyBasicAuth "user" "pass" $ fromJust $ parseUrl url
+-- >  applyBasicAuth "user" "pass" $ parseRequest_ url
 --
 -- Since 0.1.0
 applyBasicAuth :: S.ByteString -> S.ByteString -> Request -> Request
@@ -285,7 +336,7 @@ addProxy hst prt req =
 -- | Add a Proxy-Authorization header (with the specified username and
 -- password) to the given 'Request'. Ignore error handling:
 --
--- > applyBasicProxyAuth "user" "pass" <$> parseUrl "http://example.org"
+-- > applyBasicProxyAuth "user" "pass" <$> parseRequest "http://example.org"
 --
 -- Since 0.3.4
 
@@ -323,62 +374,67 @@ needsGunzip req hs' =
      && decompress req (fromMaybe "" $ lookup "content-type" hs')
 
 requestBuilder :: Request -> Connection -> IO (Maybe (IO ()))
-requestBuilder req Connection {..}
-    | expectContinue = flushHeaders >> return (Just (checkBadSend sendLater))
-    | otherwise      = sendNow      >> return Nothing
+requestBuilder req Connection {..} = do
+    (contentLength, sendNow, sendLater) <- toTriple (requestBody req)
+    if expectContinue
+        then flushHeaders contentLength >> return (Just (checkBadSend sendLater))
+        else sendNow >> return Nothing
   where
     expectContinue   = Just "100-continue" == lookup "Expect" (requestHeaders req)
     checkBadSend f   = f `E.catch` onRequestBodyException req
     writeBuilder     = toByteStringIO connectionWrite
-    writeHeadersWith = writeBuilder . (builder `mappend`)
-    flushHeaders     = writeHeadersWith flush
+    writeHeadersWith contentLength = writeBuilder . (builder contentLength `mappend`)
+    flushHeaders contentLength     = writeHeadersWith contentLength flush
 
-    (contentLength, sendNow, sendLater) =
-        case requestBody req of
-            RequestBodyLBS lbs ->
-                let body  = fromLazyByteString lbs
-                    now   = checkBadSend $ writeHeadersWith body
-                    later = writeBuilder body
-                in (Just (L.length lbs), now, later)
-
-            RequestBodyBS bs ->
-                let body  = fromByteString bs
-                    now   = checkBadSend $ writeHeadersWith body
-                    later = writeBuilder body
-                in (Just (fromIntegral $ S.length bs), now, later)
-
-            RequestBodyBuilder len body ->
-                let now   = checkBadSend $ writeHeadersWith body
-                    later = writeBuilder body
-                in (Just len, now, later)
-
-            -- See https://github.com/snoyberg/http-client/issues/74 for usage
-            -- of flush here.
-            RequestBodyStream len stream ->
-                let body = writeStream False stream
-                    -- Don't check for a bad send on the headers themselves.
-                    -- Ideally, we'd do the same thing for the other request body
-                    -- types, but it would also introduce a performance hit since
-                    -- we couldn't merge request headers and bodies together.
-                    now  = flushHeaders >> checkBadSend body
-                in (Just len, now, body)
-
-            RequestBodyStreamChunked stream ->
-                let body = writeStream True stream
-                    now  = flushHeaders >> checkBadSend body
-                in (Nothing, now, body)
+    toTriple (RequestBodyLBS lbs) = do
+        let body  = fromLazyByteString lbs
+            len   = Just $ L.length lbs
+            now   = checkBadSend $ writeHeadersWith len body
+            later = writeBuilder body
+        return (len, now, later)
+    toTriple (RequestBodyBS bs) = do
+        let body  = fromByteString bs
+            len   = Just $ fromIntegral $ S.length bs
+            now   = checkBadSend $ writeHeadersWith len body
+            later = writeBuilder body
+        return (len, now, later)
+    toTriple (RequestBodyBuilder len body) = do
+        let now   = checkBadSend $ writeHeadersWith (Just len) body
+            later = writeBuilder body
+        return (Just len, now, later)
+    toTriple (RequestBodyStream len stream) = do
+        -- See https://github.com/snoyberg/http-client/issues/74 for usage
+        -- of flush here.
+        let body = writeStream False stream
+            -- Don't check for a bad send on the headers themselves.
+            -- Ideally, we'd do the same thing for the other request body
+            -- types, but it would also introduce a performance hit since
+            -- we couldn't merge request headers and bodies together.
+            now  = flushHeaders (Just len) >> checkBadSend body
+        return (Just len, now, body)
+    toTriple (RequestBodyStreamChunked stream) = do
+        let body = writeStream True stream
+            now  = flushHeaders Nothing >> checkBadSend body
+        return (Nothing, now, body)
+    toTriple (RequestBodyIO mbody) = mbody >>= toTriple
 
     writeStream isChunked withStream =
         withStream loop
       where
         loop stream = do
             bs <- stream
-            when isChunked $
-                connectionWrite $ S8.pack $ showHex (S.length bs) (if S.null bs then "\r\n\r\n" else "\r\n")
-            unless (S.null bs) $ do
-                connectionWrite bs
-                when isChunked $ connectionWrite "\r\n"
-                loop stream
+            if S.null bs
+                then when isChunked $ connectionWrite "0\r\n\r\n"
+                else do
+                    connectionWrite $
+                        if isChunked
+                            then S.concat
+                                [ S8.pack $ showHex (S.length bs) "\r\n"
+                                , bs
+                                , "\r\n"
+                                ]
+                            else bs
+                    loop stream
 
 
     hh
@@ -412,14 +468,15 @@ requestBuilder req Connection {..}
             Nothing -> ("Host", hh) : x
             Just{} -> x
 
-    headerPairs :: W.RequestHeaders
-    headerPairs = hostHeader
+    headerPairs :: Maybe Int64 -> W.RequestHeaders
+    headerPairs contentLength
+                = hostHeader
                 $ acceptEncodingHeader
                 $ contentLengthHeader contentLength
                 $ requestHeaders req
 
-    builder :: Builder
-    builder =
+    builder :: Maybe Int64 -> Builder
+    builder contentLength =
             fromByteString (method req)
             <> fromByteString " "
             <> requestHostname
@@ -440,13 +497,20 @@ requestBuilder req Connection {..}
             <> foldr
                 (\a b -> headerPairToBuilder a <> b)
                 (fromByteString "\r\n")
-                headerPairs
+                (headerPairs contentLength)
 
     headerPairToBuilder (k, v) =
            fromByteString (CI.original k)
         <> fromByteString ": "
         <> fromByteString v
         <> fromByteString "\r\n"
+
+-- | Modify the request so that non-2XX status codes do not generate a runtime
+-- 'StatusCodeException'.
+--
+-- @since 0.4.29
+setRequestIgnoreStatus :: Request -> Request
+setRequestIgnoreStatus req = req { checkStatus = \_ _ _ -> Nothing }
 
 -- | Set the query string to the given key/value pairs.
 --

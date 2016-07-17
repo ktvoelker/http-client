@@ -1,9 +1,16 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 -- | Support for making connections via the connection package and, in turn,
 -- the tls package suite.
+--
+-- Recommended reading: <https://github.com/commercialhaskell/jump/blob/master/doc/http-client.md>
 module Network.HTTP.Client.TLS
-    ( tlsManagerSettings
+    ( -- * Settings
+      tlsManagerSettings
     , mkManagerSettings
+      -- * Global manager
+    , getGlobalManager
+    , setGlobalManager
+      -- * Internal
     , getTlsConnection
     ) where
 
@@ -15,7 +22,11 @@ import qualified Network.Connection as NC
 import Network.Socket (HostAddress)
 import qualified Network.TLS as TLS
 import qualified Data.ByteString as S
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import System.IO.Unsafe (unsafePerformIO)
 
+-- | Create a TLS-enabled 'ManagerSettings' with the given 'NC.TLSSettings' and
+-- 'NC.SockSettings'
 mkManagerSettings :: NC.TLSSettings
                   -> Maybe NC.SockSettings
                   -> ManagerSettings
@@ -42,23 +53,19 @@ mkManagerSettings tls sock = defaultManagerSettings
                             Just NoResponseDataReceived -> True
                             Just IncompleteHeaders -> True
                             _ -> False
-    , managerWrapIOException =
+    , managerWrapIOException = 
         let wrapper se =
                 case fromException se of
                     Just e -> toException $ InternalIOException e
-                    Nothing ->
-                        case fromException se of
-                            Just TLS.Terminated{} -> toException $ TlsException se
-                            _ ->
-                                case fromException se of
-                                    Just TLS.HandshakeFailed{} -> toException $ TlsException se
-                                    _ ->
-                                        case fromException se of
-                                            Just TLS.ConnectionNotEstablished -> toException $ TlsException se
-                                            _ -> se
+                    Nothing -> case fromException se of
+                      Just TLS.Terminated{} -> toException $ TlsException se
+                      Just TLS.HandshakeFailed{} -> toException $ TlsException se
+                      Just TLS.ConnectionNotEstablished -> toException $ TlsException se
+                      _ -> se
          in handle $ throwIO . wrapper
     }
 
+-- | Default TLS-enabled manager settings
 tlsManagerSettings :: ManagerSettings
 tlsManagerSettings = mkManagerSettings def Nothing
 
@@ -111,3 +118,21 @@ convertConnection conn = makeConnection
     -- on the socket.  But when this is called the socket might be
     -- already closed, and we get a @ResourceVanished@.
     (NC.connectionClose conn `Control.Exception.catch` \(_ :: IOException) -> return ())
+
+-- | Evil global manager, to make life easier for the common use case
+globalManager :: IORef Manager
+globalManager = unsafePerformIO (newManager tlsManagerSettings >>= newIORef)
+{-# NOINLINE globalManager #-}
+
+-- | Get the current global 'Manager'
+--
+-- @since 0.2.4
+getGlobalManager :: IO Manager
+getGlobalManager = readIORef globalManager
+{-# INLINE getGlobalManager #-}
+
+-- | Set the current global 'Manager'
+--
+-- @since 0.2.4
+setGlobalManager :: Manager -> IO ()
+setGlobalManager = writeIORef globalManager
